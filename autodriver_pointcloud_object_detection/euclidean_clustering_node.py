@@ -2,6 +2,10 @@
 ROS2 node for obstacle detection using Euclidean Clustering on Point Clouds.
 Publishes clustered pointcloud, visualization markers, and object array.
 
+Usage:
+    sudo apt-get install ros-${ROS_DISTRO}-derived-object-msgs
+    ros2 run pointcloud_obstacle_detection euclidean_clustering_node
+
 Todo:
     * Use python composition to run this node with pointcloud preprocessor
 """
