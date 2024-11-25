@@ -2,7 +2,7 @@ from setuptools import find_packages, setup
 import os
 from glob import glob
 
-package_name = 'pointcloud_obstacle_detection'
+package_name = 'autodriver_pointcloud_object_detection'
 
 data_files = [
     ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
@@ -62,7 +62,7 @@ setup(
         tests_require=['pytest'],
         entry_points={
             'console_scripts': [
-                'pointcloud_obstacle_detection = pointcloud_obstacle_detection.euclidean_clustering_node:main',
+                'euclidean_cluster_detector = autodriver_pointcloud_object_detection.euclidean_clustering_node:main',
             ],
         },
 )
