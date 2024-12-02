@@ -7,6 +7,8 @@ Usage:
     ros2 run pointcloud_obstacle_detection euclidean_clustering_node
 
 Todo:
+    * tune parameters for speed and acccuracy
+    * Upsample the detected cluster using the bounding box extent then recluster based on the original point cloud
     * Use python composition to run this node with pointcloud preprocessor
 """
 
@@ -66,7 +68,7 @@ class ObstacleDetectionNode(Node):
         self.declare_parameter('objects_topic', '/detected_objects')
         self.declare_parameter('marker_lifetime', 0.1)  # seconds
         self.declare_parameter('queue_size', 1)
-        self.declare_parameter('use_gpu', False)
+        self.declare_parameter('use_gpu', True)
         self.declare_parameter('cpu_backend', 'numpy')  # numpy or pytorch
         self.declare_parameter('robot_frame', 'base_link')
         self.declare_parameter('static_camera_to_robot_tf', True)
@@ -184,6 +186,7 @@ class ObstacleDetectionNode(Node):
             rgb_offset = None
 
             for idx, field in enumerate(ros_cloud.fields):
+                # todo: add all fields
                 if field.name == 'x':
                     xyz_offset[0] = idx
                 elif field.name == 'y':
@@ -222,8 +225,11 @@ class ObstacleDetectionNode(Node):
             b = (rgb_bytes & 0xFF).astype(np.float32) / 255.0
 
             # Stack RGB channels
-            colors_np = np.vstack((r, g, b)).T
+            colors_np = np.vstack((r, g, b)).T  # todo: use hstack instead
             self.processing_times['data_preparation'] = time.time() - start_time
+
+            # Clear the pointcloud
+            self.o3d_pointcloud.clear()
 
             # Convert numpy arrays to tensors and move to device
             start_time = time.time()
@@ -413,7 +419,7 @@ class ObstacleDetectionNode(Node):
         """
         self.get_logger().info("Clustering point cloud with DBSCAN...")
 
-        # Ensure the point cloud is in GPU memory
+        # Ensure the point cloud is in memory
         if self.o3d_pointcloud.is_empty():
             self.get_logger().info(f"Pointcloud is empty")
             return [], []
@@ -424,10 +430,13 @@ class ObstacleDetectionNode(Node):
                 min_points=self.min_cluster_size,
                 print_progress=True  # todo: set to False
         )
+        #self.o3d_pointcloud.point.labels = labels  # if adding label, create a new Pointcloud Tensor Geometry object in each callback or clear
 
         # Get unique labels (excluding noise points labeled as -1)
-        labels = labels.cpu().numpy()  # todo: transfer to torch using dlpack and get unique labels
-        unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)
+        labels = torch.utils.dlpack.from_dlpack(labels.to_dlpack())
+        # labels = labels.cpu().numpy()
+        # unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)  # largest_cluster_label = max(labels, key=lambda l: np.sum(labels == l))
+        unique_labels, counts = torch.unique(labels[labels != -1], return_counts=True)
 
         if len(unique_labels) == 0:
             self.get_logger().info(f"unique labels: {unique_labels}, len: {len(unique_labels)}")
@@ -443,13 +452,18 @@ class ObstacleDetectionNode(Node):
 
         for label in unique_labels:
             # Create mask for current cluster
-            mask = labels == label
-            mask = o3c.Tensor(mask, device=self.o3d_device)
+            mask = (labels == label)
+
+            # we convert the boolean array to an integer array since dlpack does not support zero-copy transfer for bool
+            mask = mask.to(device=self.torch_device, dtype=torch.uint8)
+            mask = o3c.Tensor.from_dlpack(
+                torch.utils.dlpack.to_dlpack(mask))  # o3c.Tensor(mask, device=self.o3d_device)
+            mask = mask.to(o3c.Dtype.Bool)  # convert back to a boolean mask
 
             # Create new pointcloud for cluster
             cluster_pcd = self.o3d_pointcloud.select_by_mask(mask)
 
-            # # Get cluster height. todo: use mask
+            # # Get cluster height. todo: use mask to remove clusters with min_height > threshold
             # points = cluster_pcd.point.positions.cpu().numpy()
             # min_z = np.min(points[:, 2])
             # max_z = np.max(points[:, 2])
@@ -519,7 +533,8 @@ class ObstacleDetectionNode(Node):
         return point_cloud2.create_cloud(header, fields, cloud_data)
 
     def create_marker_array(self, clusters, bboxes, frame_id):
-        """Create a MarkerArray message from the detected clusters."""
+        """Create a MarkerArray message from the detected clusters.
+        Todo: speed up by looping through clusters once instead of for each message"""
         marker_array = MarkerArray()
         for i, cluster in enumerate(clusters):
             if cluster.is_empty():
