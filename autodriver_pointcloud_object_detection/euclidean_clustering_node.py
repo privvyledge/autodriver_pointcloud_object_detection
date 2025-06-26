@@ -8,6 +8,9 @@ Usage:
 
 Todo:
     * publish cluster labels
+    * publish labels colormap
+    * pass namespace to preprocessing params
+    * switch to self.get_parameter_or(name, alternative_value=None) instead of self.get_parameter(name)
     * project the pointcloud to an  image frame
         i. Copy the current image and camera info in the pointcloud callback (or use message_filters)
         ii. (optional) project the pointcloud to the robots frame
@@ -76,7 +79,8 @@ from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_nump
 class ObstacleDetectionNode(PointcloudPreprocessorNode):
     def __init__(self):
         # See PointcloudPreprocessorNode for parameters and variables initialized
-        super(ObstacleDetectionNode, self).__init__("obstacle_detection_node", enabled=False)
+        super(ObstacleDetectionNode, self).__init__("obstacle_detection_node", enabled=False,
+                                                    parameter_namespace='pointcloud_preprocessor')
 
         # Declare parameters
         # self.declare_parameter(name='input_topic', value="/camera/camera/depth/color/points",
@@ -141,8 +145,8 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         self.objects_topic = self.get_parameter('objects_topic').value
         self.marker_lifetime = self.get_parameter('marker_lifetime').value
         # self.qos = self.get_parameter('qos').get_parameter_value().string_value
-        # self.queue_size = self.get_parameter('queue_size').value
-        # self.use_gpu = self.get_parameter('use_gpu').value
+        # self.queue_size = self.get_parameter_or('queue_size', 1).value
+        # self.use_gpu = self.get_parameter_or('use_gpu', 2).value
         # self.cpu_backend = self.get_parameter('cpu_backend').value
         # self.robot_frame = self.get_parameter('robot_frame').value
         # self.static_camera_to_robot_tf = self.get_parameter('static_camera_to_robot_tf').value
@@ -243,7 +247,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
             clusters, bboxes = self.detect_obstacles()
             self.processing_times['detect_obstacles'] = get_time_difference(start_time,
                                                                             get_current_time(monotonic=False))
-            self.get_logger().info(f"Cluster {clusters}, length: {len(clusters)}, bbox length: {len(bboxes)}")
+            # self.get_logger().info(f"Cluster {clusters}, length: {len(clusters)}, bbox length: {len(bboxes)}")
 
             if clusters:
                 # Publish clustered pointcloud
@@ -310,11 +314,11 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         Return the list of clusters.
         Todo: remove clusters with more points than self.max_cluster_size
         """
-        self.get_logger().info("Clustering point cloud with DBSCAN...")
+        # self.get_logger().info("Clustering point cloud with DBSCAN...")
 
         # Ensure the point cloud is in memory
         if self.o3d_pointcloud.is_empty():
-            self.get_logger().info(f"Pointcloud is empty")
+            # self.get_logger().info(f"Pointcloud is empty")
             return [], []
 
         # Use GPU DBSCAN clustering.
@@ -332,13 +336,13 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         unique_labels, counts = torch.unique(labels[labels != -1], return_counts=True)  # todo: switch to unique_consecutive
 
         if len(unique_labels) == 0:
-            self.get_logger().info(f"unique labels: {unique_labels}, len: {len(unique_labels)}")
+            # self.get_logger().info(f"unique labels: {unique_labels}, len: {len(unique_labels)}")
             return [], []  # Return empty lists if no valid clusters
 
         #unique_labels = unique_labels[unique_labels >= 0]
 
         max_label = labels.max().item()
-        self.get_logger().info(f"DBSCAN found {max_label + 1} clusters")
+        # self.get_logger().info(f"DBSCAN found {max_label + 1} clusters")
 
         clusters = []
         bboxes = []
@@ -423,7 +427,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
                 extent = bbox.get_extent().cpu().numpy().tolist()
                 marker.pose.orientation = Quaternion(x=0.0, y=0.0, z=0.0, w=1.0)
 
-            self.get_logger().info(f"center: {center}, type: {type(center)}")
+            # self.get_logger().info(f"center: {center}, type: {type(center)}")
             marker.pose.position.x = center[0]
             marker.pose.position.y = center[1]
             marker.pose.position.z = center[2]
