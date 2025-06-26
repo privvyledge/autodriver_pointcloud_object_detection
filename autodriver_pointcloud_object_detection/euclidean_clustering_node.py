@@ -7,9 +7,12 @@ Usage:
     ros2 run pointcloud_obstacle_detection euclidean_clustering_node
 
 Todo:
+    * Create separate class/utils for clustering
+    * Setup hdbscan (sklearn contrib), sklearn hdbscan
     * publish cluster labels
     * publish labels colormap
-    * pass namespace to preprocessing params
+    * pass namespace to preprocessing params [done]
+    * declare parameters for the object detection node without the preprocessing namespace, i.e have separate parameters for common preprocessing and object detection parameters like use_gpu
     * switch to self.get_parameter_or(name, alternative_value=None) instead of self.get_parameter(name)
     * project the pointcloud to an  image frame
         i. Copy the current image and camera info in the pointcloud callback (or use message_filters)
@@ -83,6 +86,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
                                                     parameter_namespace='pointcloud_preprocessor')
 
         # Declare parameters
+        # todo: get common parameter values using the parameter namespace
         # self.declare_parameter(name='input_topic', value="/camera/camera/depth/color/points",
         #                        descriptor=ParameterDescriptor(
         #                                description='',
@@ -116,9 +120,10 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
 
         self.declare_parameter("cluster_tolerance", 0.2)  # meters
         self.declare_parameter("min_cluster_size", 100)
-        self.declare_parameter("max_cluster_size", 10000)
+        self.declare_parameter("max_cluster_size", 1000)  # values <= 0 means no limit
         self.declare_parameter('cluster_min_height', 0.1)  # min height of cluster
         self.declare_parameter('cluster_max_height', 2.0)  # max height of cluster
+        self.declare_parameter('verbose', False)
 
         self.declare_parameter("generate_bounding_box", True)
         self.declare_parameter("bounding_box_type", "AABB")  # AABB or OBB
@@ -165,6 +170,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         self.max_cluster_size = self.get_parameter("max_cluster_size").get_parameter_value().integer_value
         self.cluster_min_height = self.get_parameter('cluster_min_height').value
         self.cluster_max_height = self.get_parameter('cluster_max_height').value
+        self.verbose = self.get_parameter('verbose').value
         self.generate_bounding_box = self.get_parameter("generate_bounding_box").value
         self.bounding_box_type = self.get_parameter("bounding_box_type").value
         # self.generate_convex_hull = self.get_parameter("generate_convex_hull").value
@@ -312,7 +318,6 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         """
         Perform DBSCAN clustering and return clusters with their bounding boxes.
         Return the list of clusters.
-        Todo: remove clusters with more points than self.max_cluster_size
         """
         # self.get_logger().info("Clustering point cloud with DBSCAN...")
 
@@ -325,7 +330,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         labels = self.o3d_pointcloud.cluster_dbscan(
                 eps=self.cluster_tolerance,
                 min_points=self.min_cluster_size,
-                print_progress=True  # todo: set to False
+                print_progress=self.verbose
         )
         self.o3d_pointcloud.point.labels = labels  # if adding label, create a new Pointcloud Tensor Geometry object in each callback or clear
 
@@ -334,6 +339,8 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         # labels = labels.cpu().numpy()
         # unique_labels, counts = np.unique(labels[labels != -1], return_counts=True)  # largest_cluster_label = max(labels, key=lambda l: np.sum(labels == l))
         unique_labels, counts = torch.unique(labels[labels != -1], return_counts=True)  # todo: switch to unique_consecutive
+        # unique_labels, counts = torch.unique_consecutive(labels[labels != -1], return_counts=True)
+        # unique_labels = set(unique_labels.tolist())
 
         if len(unique_labels) == 0:
             # self.get_logger().info(f"unique labels: {unique_labels}, len: {len(unique_labels)}")
@@ -344,14 +351,17 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         max_label = labels.max().item()
         # self.get_logger().info(f"DBSCAN found {max_label + 1} clusters")
 
+        # select unique labels with counts < self.max_cluster_size
+        if self.max_cluster_size > 0:
+            unique_labels = unique_labels[counts < self.max_cluster_size]
+            counts = counts[counts < self.max_cluster_size]
+
         clusters = []
         bboxes = []
 
         for label in unique_labels:
             # Create mask for current cluster
             mask = (labels == label)
-
-            # todo: remove clusters with more points than self.max_cluster_size, use counts or mask length
 
             # we convert the boolean array to an integer array since dlpack does not support zero-copy transfer for bool
             mask = mask.to(device=self.torch_device, dtype=torch.uint8)
@@ -361,16 +371,20 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
 
             # Create new pointcloud for cluster
             cluster_pcd = self.o3d_pointcloud.select_by_mask(mask)
+            points = cluster_pcd.point.positions
 
-            # # Get cluster height. todo: use mask to remove clusters with min_height > threshold
-            # points = cluster_pcd.point.positions.cpu().numpy()
-            # min_z = np.min(points[:, 2])
-            # max_z = np.max(points[:, 2])
-            # height = max_z - min_z
-            #
-            # # Filter clusters by height
-            # if height < self.cluster_min_height or height > self.cluster_max_height:
-            #     continue
+            # remove large clusters. This is redundant since we already removed unique_labels with counts < self.max_cluster_size
+            if 0 < self.max_cluster_size < points.shape[0]:
+                continue
+
+            # Get cluster height
+            min_z = points[:, 2].min().item()
+            max_z = points[:, 2].max().item()
+            height = max_z - min_z
+
+            # Filter clusters by height. height < self.cluster_min_height or height > self.cluster_max_height
+            if not (self.cluster_min_height <= height <= self.cluster_max_height):
+                continue
 
             clusters.append(cluster_pcd)
 
