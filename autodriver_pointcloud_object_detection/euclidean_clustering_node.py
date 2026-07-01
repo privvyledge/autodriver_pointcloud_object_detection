@@ -31,6 +31,11 @@ from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point, Vector3, Pose, Quaternion
 from derived_object_msgs.msg import Object, ObjectArray
 from shape_msgs.msg import SolidPrimitive
+try:
+    from nav2_dynamic_msgs.msg import Obstacle, ObstacleArray
+    NAV2_DYNAMIC_MSGS_AVAILABLE = True
+except ImportError:
+    NAV2_DYNAMIC_MSGS_AVAILABLE = False
 import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
@@ -178,6 +183,9 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         self.declare_parameter("project_clusters_to_image", False)
         self.declare_parameter("classify_image_clusters", False)
         self.declare_parameter("get_image_from_pointcloud", False)
+        self.declare_parameter('publish_object_array', True)
+        self.declare_parameter('publish_obstacle_array', False)
+        self.declare_parameter('obstacles_topic', 'detected_obstacles')
         self.declare_parameter(name='input_image_topic', value="/camera/camera/color/image_raw",
                                descriptor=ParameterDescriptor(
                                        description='The input image topic. '
@@ -196,6 +204,9 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         self.markers_topic = self.get_parameter('markers_topic').value
         self.objects_topic = self.get_parameter('objects_topic').value
         self.marker_lifetime = self.get_parameter('marker_lifetime').value
+        self.publish_object_array = self.get_parameter('publish_object_array').get_parameter_value().bool_value
+        self.publish_obstacle_array = self.get_parameter('publish_obstacle_array').get_parameter_value().bool_value
+        self.obstacles_topic = self.get_parameter('obstacles_topic').value
         # self.qos = self.get_parameter('qos').get_parameter_value().string_value
         # self.queue_size = self.get_parameter_or('queue_size', 1).value
         # self.use_gpu = self.get_parameter_or('use_gpu', 2).value
@@ -292,7 +303,16 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         # Setup publishers
         self.pointcloud_pub = self.create_publisher(PointCloud2, self.output_topic, self.queue_size)
         self.marker_pub = self.create_publisher(MarkerArray, self.markers_topic, 10)
-        self.objects_pub = self.create_publisher(ObjectArray, self.objects_topic, 10)
+        if self.publish_object_array:
+            self.objects_pub = self.create_publisher(ObjectArray, self.objects_topic, 10)
+
+        self._nav2_warned = False
+        if self.publish_obstacle_array:
+            if NAV2_DYNAMIC_MSGS_AVAILABLE:
+                self.obstacles_pub = self.create_publisher(ObstacleArray, self.obstacles_topic, 10)
+            else:
+                self.get_logger().warning("nav2_dynamic_msgs not available; nav2 ObstacleArray output disabled")
+                self._nav2_warned = True
 
         # self.pointcloud_timer = self.create_timer(1 / self.odom_rate, self.rgbd_timer_callback)
         self.get_logger().info(f"{self.get_fully_qualified_name()} node started on device: {self.o3d_device}")
@@ -325,11 +345,11 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
 
             # Get clusters then combine them to form a clustered pointcloud, Get bounding boxes. Create MarkerArray and ObjectArray
             start_time = get_current_time(monotonic=False)
-            clusters, bboxes, quat, combined_pcd, marker_array, object_array = self.get_clusters(o3d_labels,
+            clusters, bboxes, quat, combined_pcd, marker_array, object_array, obstacle_array = self.get_clusters(o3d_labels,
                                                                                                 stamp=new_header.stamp,
                                                                                                 frame_id=new_header.frame_id)
             self.processing_times['obstacle_postprocessing'] = get_time_difference(start_time,
-                                                                            get_current_time(monotonic=False))
+                                                                             get_current_time(monotonic=False))
             # self.get_logger().info(f"Cluster {clusters}, length: {len(clusters)}, bbox length: {len(bboxes)}")
 
             if clusters:
@@ -341,7 +361,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
                     pc_msg = self.tensor_to_ros_cloud(processed_struct, self.pointfields, header=new_header)
                     pc_msg.is_dense = self.remove_nans and self.remove_infs
                     self.processing_times['prepare_pointcloud'] = get_time_difference(
-                        start_time, get_current_time(monotonic=True))
+                         start_time, get_current_time(monotonic=True))
                     start_time = get_current_time(monotonic=True)
                     self.pointcloud_pub.publish(pc_msg)
                     self.processing_times['pointcloud_pub'] = get_time_difference(start_time,
@@ -358,8 +378,12 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
                     self.marker_pub.publish(marker_array)
 
                 # Create and publish object array
-                if object_array:
+                if object_array and self.publish_object_array and hasattr(self, 'objects_pub'):
                     self.objects_pub.publish(object_array)
+
+                # Create and publish obstacle array
+                if obstacle_array and hasattr(self, 'obstacles_pub'):
+                    self.obstacles_pub.publish(obstacle_array)
 
             self.processing_times['total_callback_time'] = get_time_difference(callback_start_time, get_current_time(monotonic=False))
             # # Log processing info
@@ -433,7 +457,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
 
         if len(unique_labels) == 0:
             # self.get_logger().info(f"unique labels: {unique_labels}, len: {len(unique_labels)}")
-            return [], [], [], [], [], []   # Return empty lists if no valid clusters
+            return [], [], [], [], [], [], None   # Return empty lists if no valid clusters
 
         max_label = labels.max().item()
         # self.get_logger().info(f"DBSCAN found {max_label + 1} clusters")
@@ -459,6 +483,12 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
             object_array = ObjectArray()  # Create an ObjectArray message from the detected clusters.
             object_array.header.frame_id = frame_id
             object_array.header.stamp = stamp
+
+        obstacle_array = None
+        if self.publish_obstacle_array and NAV2_DYNAMIC_MSGS_AVAILABLE:
+            obstacle_array = ObstacleArray()
+            obstacle_array.header.frame_id = frame_id
+            obstacle_array.header.stamp = stamp
 
         # Group points by label in a single pass instead of an O(N*K) per-cluster boolean
         # mask. argsort once, then each cluster is a contiguous slice of point indices.
@@ -537,7 +567,11 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
                     object_msg = self.create_object(i, center, extent, quat, stamp, frame_id)
                     object_array.objects.append(object_msg)
 
-        return clusters, bboxes, quat, combined_pcd, marker_array, object_array
+                if obstacle_array is not None:
+                    obstacle_msg = self.create_obstacle(i, center, extent, quat)
+                    obstacle_array.obstacles.append(obstacle_msg)
+
+        return clusters, bboxes, quat, combined_pcd, marker_array, object_array, obstacle_array
 
 
     def create_marker(self, i, center, extent, quat, stamp, frame_id=''):
@@ -588,6 +622,26 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         obj.classification_certainty = int(125)
         return obj
 
+    def create_obstacle(self, i, center, extent, quat):
+        """Create a nav2_dynamic_msgs/Obstacle message from the detected cluster."""
+        import uuid
+        obj = Obstacle()
+        obj.uuid.uuid = list(uuid.uuid4().bytes)
+        obj.score = 1.0
+
+        # Position
+        obj.position.x = float(center[0])
+        obj.position.y = float(center[1])
+        obj.position.z = float(center[2])
+
+        # Size
+        obj.size.x = float(extent[0])
+        obj.size.y = float(extent[1])
+        obj.size.z = float(extent[2])
+
+        # Velocity at default zero
+        return obj
+
 
     def clustering_parameter_change_callback(self, params):
         result = SetParametersResult()
@@ -598,7 +652,23 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
 
         # Iterate over each parameter in this node
         for param in params:
-            if param.name == 'cluster_tolerance' and param.type_ == Parameter.Type.DOUBLE:
+            if param.name == 'publish_object_array' and param.type_ == Parameter.Type.BOOL:
+                self.publish_object_array = param.value
+                if self.publish_object_array and not hasattr(self, 'objects_pub'):
+                    self.objects_pub = self.create_publisher(ObjectArray, self.objects_topic, 10)
+            elif param.name == 'publish_obstacle_array' and param.type_ == Parameter.Type.BOOL:
+                self.publish_obstacle_array = param.value
+                if self.publish_obstacle_array:
+                    if NAV2_DYNAMIC_MSGS_AVAILABLE:
+                        if not hasattr(self, 'obstacles_pub'):
+                            self.obstacles_pub = self.create_publisher(ObstacleArray, self.obstacles_topic, 10)
+                    else:
+                        if not getattr(self, '_nav2_warned', False):
+                            self.get_logger().warning("nav2_dynamic_msgs not available; nav2 ObstacleArray output disabled")
+                            self._nav2_warned = True
+            elif param.name == 'obstacles_topic' and param.type_ == Parameter.Type.STRING:
+                self.obstacles_topic = param.value
+            elif param.name == 'cluster_tolerance' and param.type_ == Parameter.Type.DOUBLE:
                 self.cluster_tolerance = param.value
             elif param.name == 'min_cluster_size' and param.type_ == Parameter.Type.INTEGER:
                 self.min_cluster_size = param.value
