@@ -34,10 +34,29 @@ from shape_msgs.msg import SolidPrimitive
 import tf2_ros
 from tf2_ros import TransformBroadcaster, TransformListener, Buffer, LookupException, ConnectivityException, \
     ExtrapolationException
-import tf_transformations
 import numpy as np
 import transforms3d
-from tf_transformations import quaternion_matrix, quaternion_from_matrix
+
+try:
+    from tf_transformations import quaternion_from_matrix
+except ImportError:
+    def quaternion_from_matrix(matrix):
+        """Fallback: 4x4/3x3 rotation matrix -> [x, y, z, w] (tf_transformations absent)."""
+        m = np.asarray(matrix, dtype=np.float64)[:3, :3]
+        t = np.trace(m)
+        if t > 0.0:
+            s = np.sqrt(t + 1.0) * 2.0
+            w, x, y, z = 0.25 * s, (m[2, 1] - m[1, 2]) / s, (m[0, 2] - m[2, 0]) / s, (m[1, 0] - m[0, 1]) / s
+        elif m[0, 0] > m[1, 1] and m[0, 0] > m[2, 2]:
+            s = np.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+            w, x, y, z = (m[2, 1] - m[1, 2]) / s, 0.25 * s, (m[0, 1] + m[1, 0]) / s, (m[0, 2] + m[2, 0]) / s
+        elif m[1, 1] > m[2, 2]:
+            s = np.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+            w, x, y, z = (m[0, 2] - m[2, 0]) / s, (m[0, 1] + m[1, 0]) / s, 0.25 * s, (m[1, 2] + m[2, 1]) / s
+        else:
+            s = np.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+            w, x, y, z = (m[1, 0] - m[0, 1]) / s, (m[0, 2] + m[2, 0]) / s, (m[1, 2] + m[2, 1]) / s, 0.25 * s
+        return [x, y, z, w]
 from cv_bridge import CvBridge
 import cv2
 
@@ -53,12 +72,13 @@ from autodriver_pointcloud_preprocessor.utils import (convert_pointcloud_to_nump
                                                       pointcloud_to_dict, get_pointcloud_metadata,
                                                       check_field, crop_pointcloud,
                                                       extract_rgb_from_pointcloud, get_fields_from_dicts,
-                                                      remove_duplicates, rgb_int_to_float,
+                                                      remove_duplicates, rgb_float_to_bytes,
                                                       FIELD_DTYPE_MAP, FIELD_DTYPE_MAP_INV)
 
-from autodriver_pointcloud_object_detection.pointcloud_clustering import (PointCloudClustering,
-                                                                          OPEN3D_INSTALLED, HDBSCAN_INSTALLED,
-                                                                          SKLEARN_INSTALLED)
+
+# from autodriver_pointcloud_object_detection.pointcloud_clustering import (PointCloudClustering,
+#                                                                           OPEN3D_INSTALLED, HDBSCAN_INSTALLED,
+#                                                                           SKLEARN_INSTALLED)
 
 
 def get_unique_labels(labels: torch.Tensor, method: int = 1, dim: int = None) -> Union[torch.Tensor, set]:
@@ -104,8 +124,10 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
     def __init__(self):
         # See PointcloudPreprocessorNode for parameters and variables initialized
         super(ObstacleDetectionNode, self).__init__("obstacle_detection_node", enabled=False,
-                                                    parameter_namespace='pointcloud_preprocessor')
+                                                    parameter_namespace='pointcloud_preprocessor',
+                                                    enable_parameter_change_callback=False)
 
+        # self.remove_on_set_parameters_callback(super(ObstacleDetectionNode, self).parameter_change_callback)
         # Declare parameters
         # todo: get common parameter values using the parameter namespace
         # self.declare_parameter(name='input_topic', value="/camera/camera/depth/color/points",
@@ -119,8 +141,8 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         # self.declare_parameter(name='qos', value="SENSOR_DATA", descriptor=ParameterDescriptor(
         #         description='',
         #         type=ParameterType.PARAMETER_STRING))
-        self.declare_parameter('markers_topic', '/obstacle_markers')
-        self.declare_parameter('objects_topic', '/detected_objects')
+        self.declare_parameter('markers_topic', 'obstacle_markers')
+        self.declare_parameter('objects_topic', 'detected_objects')
         self.declare_parameter('marker_lifetime', 0.1)  # seconds
         # self.declare_parameter('queue_size', 1)
         # self.declare_parameter('use_gpu', True)
@@ -250,14 +272,20 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         # change one or more parameters of the node.
         self.add_on_set_parameters_callback(self.clustering_parameter_change_callback)
 
-        # #################### Todo: pointcloud clustering test
-        self.clusterer_open3d = PointCloudClustering(method=self.clustering_method, backend=self.clustering_backend)
-        self.clusterer_sklearn_hdbscan = PointCloudClustering(method='hdbscan', backend='sklearn')
-        self.clusterer_sklearn_dbscan = PointCloudClustering(method='dbscan', backend='sklearn')
-        self.clusterer_hdbscan_hdbscan = PointCloudClustering(method='hdbscan', backend='hdbscan')
-        # #################### Todo: pointcloud clustering test
+        # # #################### Todo: pointcloud clustering test
+        # self.clusterer_open3d = PointCloudClustering(method=self.clustering_method, backend=self.clustering_backend)
+        # self.clusterer_sklearn_hdbscan = PointCloudClustering(method='hdbscan', backend='sklearn')
+        # self.clusterer_sklearn_dbscan = PointCloudClustering(method='dbscan', backend='sklearn')
+        # self.clusterer_hdbscan_hdbscan = PointCloudClustering(method='hdbscan', backend='hdbscan')
+        # # #################### Todo: pointcloud clustering test
 
         # Setup subscribers
+        # NOTE: subscribe to the RAW LiDAR/depth cloud. This node runs the inherited
+        # preprocess() itself, so pointing input_topic at an already-preprocessed topic
+        # double-processes it (voxel/ROI/ground/TF run twice). If you must subscribe to a
+        # preprocessed topic, disable the inherited steps via the pointcloud_preprocessor
+        # namespace: voxel_size:=0.0, crop_to_roi:=false, remove_ground:=false,
+        # remove_duplicates:=false.
         self.poincloud_sub = self.create_subscription(PointCloud2, self.input_topic,
                                                       self.callback, qos_profile=qos_profile)
 
@@ -275,7 +303,8 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
 
         try:
             callback_start_time = get_current_time(monotonic=False)
-            self.extract_pointcloud(ros_cloud)
+            if self.extract_pointcloud(ros_cloud) is None:
+                return
 
             # preprocess the PointCloud
             preprocessing_start_time = get_current_time(monotonic=False)
@@ -288,9 +317,11 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
             o3d_labels = self.detect_obstacles()
             self.processing_times['detect_obstacles'] = get_time_difference(start_time,
                                                                             get_current_time(monotonic=False))
+            if o3d_labels is None:
+                return
 
             new_header = self.create_header(ros_cloud)
-            frame_id = self.robot_frame if self.camera_to_robot_tf else ros_cloud.header.frame_id  # if self.robot_frame
+            frame_id = self.robot_frame if self.camera_to_robot_tf is not None else ros_cloud.header.frame_id
 
             # Get clusters then combine them to form a clustered pointcloud, Get bounding boxes. Create MarkerArray and ObjectArray
             start_time = get_current_time(monotonic=False)
@@ -307,9 +338,10 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
                     # Publish processed point cloud
                     start_time = get_current_time(monotonic=True)
                     processed_struct = self.prepare_pointcloud(ros_cloud, o3d_pointcloud=combined_pcd)
-
                     pc_msg = self.tensor_to_ros_cloud(processed_struct, self.pointfields, header=new_header)
                     pc_msg.is_dense = self.remove_nans and self.remove_infs
+                    self.processing_times['prepare_pointcloud'] = get_time_difference(
+                        start_time, get_current_time(monotonic=True))
                     start_time = get_current_time(monotonic=True)
                     self.pointcloud_pub.publish(pc_msg)
                     self.processing_times['pointcloud_pub'] = get_time_difference(start_time,
@@ -352,7 +384,9 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
             #         f"pointcloud publishing: {1 / self.processing_times['pointcloud_pub']} \n"
             # )
         except Exception as e:
-            self.get_logger().error(f"Error processing point cloud: {str(e)}")
+            import traceback
+            self.get_logger().error(
+                f"Error processing point cloud: {str(e)}\n{traceback.format_exc()}")
 
     def detect_obstacles(self):
         """
@@ -363,13 +397,19 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
 
         # Ensure the point cloud is in memory
         if self.o3d_pointcloud.is_empty():
-            # self.get_logger().info(f"Pointcloud is empty")
-            return [], []
+            return None
 
 
         # ############# Todo: test various clustering algos
 
         # ############# Todo: test various clustering algos
+
+        # Open3D cluster_dbscan is CPU-only even on the tensor API: a GPU cloud is copied
+        # to host, clustered, and labels copied back. Keep the post-voxel/ROI point count
+        # low (~<5k on Orin Nano) via voxel_size + crop_to_roi to stay real-time.
+        if self.verbose:
+            self.get_logger().info(
+                f"DBSCAN input points: {self.o3d_pointcloud.point.positions.shape[0]}")
 
         # Use GPU DBSCAN clustering.
         labels = self.o3d_pointcloud.cluster_dbscan(
@@ -389,7 +429,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         # Get unique labels (excluding noise points labeled as -1)
         labels_ = labels[labels != -1]
         unique_labels, counts = get_unique_labels(labels_, method=1)
-        # unique_labels = unique_labels[unique_labels >= 0]
+        unique_labels = sorted(unique_labels)  # deterministic order across frames
 
         if len(unique_labels) == 0:
             # self.get_logger().info(f"unique labels: {unique_labels}, len: {len(unique_labels)}")
@@ -398,7 +438,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
         max_label = labels.max().item()
         # self.get_logger().info(f"DBSCAN found {max_label + 1} clusters")
 
-        if self.max_cluster_size > 0 and counts:
+        if self.max_cluster_size > 0 and counts is not None:
             counts_less_than_cluster_size = counts < self.max_cluster_size
             unique_labels = unique_labels[counts_less_than_cluster_size]
             # counts = counts[counts_less_than_cluster_size]
@@ -420,26 +460,33 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
             object_array.header.frame_id = frame_id
             object_array.header.stamp = stamp
 
+        # Group points by label in a single pass instead of an O(N*K) per-cluster boolean
+        # mask. argsort once, then each cluster is a contiguous slice of point indices.
+        # int64 indices are DLPack-friendly (zero-copy), avoiding the uint8<->bool round-trip
+        # and the per-cluster CUDA kernel launches that dominate on the Orin Nano.
+        order = torch.argsort(labels)
+        sorted_labels = labels[order]
+        targets = torch.as_tensor(list(unique_labels), dtype=sorted_labels.dtype,
+                                  device=sorted_labels.device)
+        left = torch.searchsorted(sorted_labels, targets, right=False)
+        right = torch.searchsorted(sorted_labels, targets, right=True)
+
         # loop through the labels to generate clusters, bboxes
         for i, label in enumerate(unique_labels):
-            # Create mask for current cluster
-            mask = (labels == label)
-
-            # Convert the boolean array to an integer array since dlpack does not support zero-copy transfer for bool
-            mask = mask.to(device=self.torch_device, dtype=torch.uint8)
-            mask = o3c.Tensor.from_dlpack(
-                torch.utils.dlpack.to_dlpack(mask))  # o3c.Tensor(mask, device=self.o3d_device)
-            mask = mask.to(o3c.Dtype.Bool)  # convert back to a boolean mask
+            # Contiguous slice of original point indices belonging to this cluster
+            cluster_idx = order[left[i]:right[i]].to(dtype=torch.int64).contiguous()
+            cluster_idx = o3c.Tensor.from_dlpack(
+                torch.utils.dlpack.to_dlpack(cluster_idx))
 
             # Create a new pointcloud for the cluster
-            cluster_pcd = self.o3d_pointcloud.select_by_mask(mask)
+            cluster_pcd = self.o3d_pointcloud.select_by_index(cluster_idx)
 
             if cluster_pcd.is_empty():
                 continue
 
             points = cluster_pcd.point.positions
 
-            # remove large clusters. This is redundant since we already removed unique_labels with counts < self.max_cluster_size
+            # Per-cluster size check — primary guard when counts unavailable (e.g. method=1)
             if 0 < self.max_cluster_size < points.shape[0]:
                 continue
 
@@ -454,7 +501,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
 
             start_time = get_current_time(monotonic=True)
             # add to combined PCD
-            if i == 0:
+            if combined_pcd is None:
                 combined_pcd = cluster_pcd
             else:
                 combined_pcd = combined_pcd + cluster_pcd
@@ -468,7 +515,7 @@ class ObstacleDetectionNode(PointcloudPreprocessorNode):
                     bounding_box = cluster_pcd.get_axis_aligned_bounding_box()
                     center = bounding_box.get_center().cpu().numpy().tolist()
                     extent = bounding_box.get_extent().cpu().numpy().tolist()
-                    quat = [0.0, 0.0, 0.0, 0.0]  # aabb does not have orientation
+                    quat = [0.0, 0.0, 0.0, 1.0]  # identity quaternion (x, y, z, w)
                 elif self.bounding_box_type.lower() == "obb":
                     bounding_box = cluster_pcd.get_oriented_bounding_box()
                     center = bounding_box.center.cpu().numpy().tolist()

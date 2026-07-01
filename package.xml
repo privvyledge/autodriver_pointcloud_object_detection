@@ -13,6 +13,7 @@
   <depend>derived_object_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>tf_transformations</depend>
+  <exec_depend>autodriver_pointcloud_preprocessor</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
